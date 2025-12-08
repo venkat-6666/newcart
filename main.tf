@@ -3,7 +3,7 @@ provider "google" {
 }
 
 resource "google_compute_instance" "default" {
-  name         = "example-instance"
+  name         = var.vmname
   machine_type = "e2-medium"
   zone         = "us-central1-a"
 
