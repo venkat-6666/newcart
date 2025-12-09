@@ -1,0 +1,109 @@
+---
+# INITIALIZE DOCKER SWARM (DOCKER INSTALLED BY TERRAFORM)
+
+- name: Initialize Docker Swarm on Manager
+  hosts: manager
+  become: yes
+  tasks:
+
+    - name: Wait for Docker daemon to be ready on manager
+      shell: docker info
+      register: docker_status
+      until: docker_status.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Leave old swarm if exists (manager)
+      shell: docker swarm leave --force
+      ignore_errors: yes
+
+    - name: Remove old swarm directory if exists (manager)
+      shell: rm -rf /var/lib/docker/swarm
+      ignore_errors: yes
+
+    - name: Initialize swarm on manager
+      shell: docker swarm init --advertise-addr {{ ansible_host }}
+
+    #  Wait for swarm to stabilize
+    - name: Wait for swarm control-plane to stabilize
+      command: sleep 20
+
+    - name: Get worker join token
+      shell: docker swarm join-token -q worker
+      register: worker_token
+
+    - name: Save join-token to hostvars
+      set_fact:
+        join_token: "{{ worker_token.stdout }}"
+
+# PREP & JOIN WORKERS
+- name: Join workers to Docker Swarm
+  hosts: workers
+  become: yes
+  tasks:
+
+    - name: Wait for Docker daemon to be ready on worker
+      shell: docker info
+      register: docker_status
+      until: docker_status.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Leave old swarm if exists (worker)
+      shell: docker swarm leave --force
+      ignore_errors: yes
+
+    - name: Remove old swarm directory if exists (worker)
+      shell: rm -rf /var/lib/docker/swarm
+      ignore_errors: yes
+
+    - name: Join worker to swarm
+      shell: docker swarm join --token {{ hostvars[groups['manager'][0]].join_token }} {{ hostvars[groups['manager'][0]].ansible_host }}:2377
+      args:
+        creates: /var/lib/docker/swarm
+
+    # >>> ADDED: Wait for worker to finish joining + overlay network sync
+    - name: Allow worker to attach overlay network
+      command: sleep 30
+
+# CLONE REPO & DEPLOY STACK (ON MANAGER)
+- name: Clone Repo & Deploy Stack
+  hosts: manager
+  become: yes
+  vars:
+    repo_url: "https://github.com/venkat-6666/docker-swarm.git"
+    repo_path: "/opt/docker-swarm"
+    stack_file: "docker-stack.yaml"
+    stack_name: "mystack"
+  tasks:
+
+    - name: Install git if missing
+      apt:
+        name: git
+        state: present
+        update_cache: yes
+
+    - name: Clone or update repository
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ repo_path }}"
+        version: main
+        force: yes
+
+    #- name: Ensure overlay network exists (idempotent)
+    #  shell: docker network create --driver overlay app-network || true
+
+    #  Wait for all nodes to be READY before deploy
+    - name: Verify swarm nodes are ready
+      shell: docker node ls
+      register: nodelist
+
+    - name: Wait for routing mesh + VXLAN network sync
+      command: sleep 60
+
+    - name: Deploy Docker stack
+      shell: docker stack deploy -c {{ repo_path }}/{{ stack_file }} {{ stack_name }}
+      args:
+        chdir: "{{ repo_path }}"
